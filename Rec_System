@@ -1,0 +1,146 @@
+### Imports
+
+## General Setup
+import pandas as pd
+import numpy as np
+# !pip install boto3
+import boto3
+import os
+import time
+import pickle
+
+# AWS Credentials and Settings
+access_key = ACCESS_KEY
+secret_key = SECRET_KEY
+
+os.environ['AWS_ACCESS_KEY_ID'] = access_key
+os.environ['AWS_SECRET_ACCESS_KEY'] = secret_key
+encoded_secret_key = secret_key.replace("/", "%2F").replace("+", "%2B")
+
+aws_region = 'us-east-1'
+
+s3 = boto3.client(
+    service_name='s3',
+    region_name=aws_region,
+    aws_access_key_id=access_key,
+    aws_secret_access_key=secret_key
+)
+
+## Spark Setup
+# !pip install pyspark
+from pyspark import SparkContext, SparkConf
+from pyspark.sql import SQLContext, SparkSession, Row, Window
+from pyspark.sql import functions as F
+from pyspark.sql.functions import udf, explode, col, collect_list, regexp_replace, split, expr, length, concat_ws, count, size, first, broadcast, monotonically_increasing_id
+from pyspark.sql.types import ArrayType, StringType, IntegerType, FloatType, DoubleType
+from pyspark import sql
+import pyspark.pandas as ps
+
+# Set up Spark
+spark = SparkSession.builder \
+    .appName("PicklesPlus") \
+    .config("spark.hadoop.fs.s3a.access.key", access_key) \
+    .config("spark.hadoop.fs.s3a.secret.key", secret_key) \
+    .config("spark.hadoop.fs.s3a.endpoint","s3." + aws_region + ".amazonaws.com") \
+    .config("spark.executor.memory", "15g") \
+    .config("spark.executor.cores", "2") \
+    .config("spark.default.parallelism", "4") \
+    .config("spark.sql.shuffle.partitions", "4") \
+    .getOrCreate()
+
+## Importing ML libraries
+from pyspark.ml import Pipeline, PipelineModel
+from pyspark.ml.linalg import DenseVector, SparseVector
+from pyspark.ml.stat import Correlation, ChiSquareTest, Summarizer
+
+from pyspark.ml.feature import StringIndexer, Tokenizer, HashingTF, IDF, VectorAssembler, StandardScaler, OneHotEncoder, Normalizer, StopWordsRemover, CountVectorizer
+
+from pyspark.mllib.linalg import Vectors, VectorUDT
+from pyspark.mllib.linalg.distributed import IndexedRow, IndexedRowMatrix
+
+from pyspark.ml.clustering import KMeans
+
+from pyspark.ml.evaluation import ClusteringEvaluator 
+
+### Model
+feat_df2 = spark.read.parquet('s3a://kagglespotify6k/trusted/feature_df_all270k/')
+
+# Aggregating the categorical features to avoid having to one hot encode with a for loop
+feat_df2 = feat_df2.withColumn('categorical', F.array(col('key'),col('mode'), col('time_signature')))
+feat_test = feat_df2.limit(900)
+## First, vectorize the textual categorical features (genre and playlists) into genre_vec
+
+# artists_genres & playlist_uris_list already tokenized -> [genre_a, genre_b, genre_c], skip straight to hashing
+hashingTF_genres = HashingTF(numFeatures = 50, inputCol = 'artists_genres', outputCol = 'genre_hash')
+idf_genres = IDF(inputCol = 'genre_hash', outputCol = 'genre_idf')
+
+hashingTF_playlists = HashingTF(numFeatures = 50, inputCol = 'playlist_uris_list', outputCol = 'playlist_hash')
+idf_playlists = IDF(inputCol = 'playlist_hash', outputCol = 'playlist_idf')
+
+## Vectorizing the music technique categorical features (key, mode, time_signature)
+# Referenced: https://stackoverflow.com/questions/35804755/apply-onehotencoder-for-several-categorical-columns-in-sparkmlib
+#   StringIndexer only takes in 1 column at a time
+hashingTF_categ = HashingTF(numFeatures = 50, inputCol = 'categorical', outputCol = 'categ_hash')
+idf_categ = IDF(inputCol = 'categ_hash', outputCol = 'categ_idf')
+
+## Vectorizing the confidence measure features (they are on a scale of 0 - 1.0)
+conf_VecAssembler = VectorAssembler(inputCols = ['acousticness', 'instrumentalness', 'speechiness', 'valence', 'danceability', 'energy', 'liveness'], outputCol = 'conf_features')
+# conf_scaler = StandardScaler(inputCol = 'conf_features', outputCol = 'scaled_conf_features')
+
+## Final feature vector 
+final_VecAssembler = VectorAssembler(inputCols=['genre_idf', 'playlist_idf', 'categ_idf', 'conf_features'], outputCol='features')
+
+## Pipeline
+pipeline = Pipeline(stages = [hashingTF_genres, idf_genres, hashingTF_playlists, idf_playlists , hashingTF_categ, idf_categ, conf_VecAssembler, final_VecAssembler])
+
+model = pipeline.fit(feat_test)
+model_df = model.transform(feat_test)
+
+# Save model
+# model_df.write().overwrite().save('s3a://kagglespotify6k/models/mile_6_model/mile_6_model_cos_sim/')
+
+
+### Similarity Measure
+# Referenced: https://stackoverflow.com/questions/34121258/cosine-similarity-via-dimsum-in-spark
+# https://spark.apache.org/docs/1.2.2/api/java/org/apache/spark/mllib/linalg/distributed/RowMatrix.html
+# https://stackoverflow.com/questions/57530010/spark-scala-cosine-similarity-matrix
+
+fin_feat = model_df.select('name','track_uri','artists_names', 'artists_genres', 'playlist_uris_list','features')
+fin_feat.cache()
+
+# Unique numeric index because number easier to manipulate than string identifier
+simfeat_test = fin_feat.withColumn("index", monotonically_increasing_id())
+
+# Convert the vectors
+def row_to_vec(row):
+    row_vec = Vectors.sparse(row['features'].size, row['features'].indices, row['features'].values)
+    return IndexedRow(row['index'], row_vec)
+
+# RDD for spark
+indexed_rows = simfeat_test.rdd.map(row_to_vec)
+
+# Create an IndexedRowMatrix
+matrix = IndexedRowMatrix(indexed_rows)
+
+# Compute similarity with DIMSUM
+matrix_cos = matrix.toRowMatrix().columnSimilarities()
+
+# Convert to DataFrame
+sim_df1 = matrix_cos.entries.map(lambda e: (e.i, e.j, e.value)).toDF(['index1', 'index2', 'similarity'])
+
+sim_df2 = sim_df1.join(simfeat_test.select('index', 'track_uri', 'name', 'artists_names'), sim_df1.index2 == simfeat_test.index, 'left')\
+    .withColumnRenamed('track_uri', 'rec_track_uri').withColumnRenamed('name', 'rec_song').withColumnRenamed('artists_names', 'rec_artists').drop('index')\
+    .join(simfeat_test.select('index', 'track_uri', 'name', 'artists_names'),sim_df1.index1 == simfeat_test.index, 'left')\
+    .withColumnRenamed('track_uri', 'orig_track_uri').withColumnRenamed('name', 'orig_song').withColumnRenamed('aritsts_names', 'orig_artists').drop('index')
+
+### Recommendation Function
+
+def song_rec_m2(track_uri, num_rec,sim_df):
+    fin_rec = sim_df.filter((sim_df['orig_track_uri'] == track_uri) & (sim_df['rec_track_uri'] != track_uri)).orderBy(col("similarity").desc()).limit(num_rec)
+    songs = fin_rec.collect()
+    print(f'Original Song: {songs[0]["orig_song"]} by {songs[0]["artists_names"]}')
+    for num, row in enumerate(songs, start = 1):
+        print(f"{num}) {row['rec_song']} by {row['artists_names']}, Score: {row['similarity']}")
+
+
+song_rec_m2('008wXvCVu8W8vCbq5VQDlC', 10, sim_df2)
